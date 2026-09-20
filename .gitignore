@@ -1,0 +1,42 @@
+# ============================================
+# Fichiers système / éditeur — actifs dès maintenant
+# ============================================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+# ============================================
+# Secrets et identifiants — à activer dès que tu manipules
+# des clés (SSH, VPN, PKI) ou des mots de passe de test
+# ============================================
+# *.key
+# *.pem
+# *id_rsa*
+# *id_ed25519*
+# *secret*
+# *password*
+# *credentials*
+# .env
+
+# ============================================
+# Infos réseau réelles de l'école — à activer si tu captures
+# du trafic sur le VRAI réseau (pas ton lab-net perso)
+# ============================================
+# config-ecole/
+# notes-polytech/
+# *.pcap
+# *.pcapng
+
+# ============================================
+# Logs générés automatiquement — à activer une fois que
+# tes services (DHCP, DNS, etc.) tournent et génèrent des logs
+# ============================================
+# *.leases
+# *.log
+# journalctl-dump*
