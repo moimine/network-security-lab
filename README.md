@@ -4,34 +4,34 @@ Network, virtualization & cybersecurity homelab: DHCP, DNS, routing, VLAN segmen
 
 ## Summary
 
-- [x] [Phase 0 — Setup](#phase-0--setup)
-- [x] [Phase 1 — First virtual network](#phase-1--first-virtual-network)
-- [x] [Phase 2 — Network servers (DHCP/DNS)](#phase-2--network-servers)
-- [ ] [Phase 3 — Routing](#phase-3--routing)
-- [ ] [Phase 4 — Firewall](#phase-4--firewall)
-- [ ] [Phase 5 — Active Directory](#phase-5--active-directory)
-- [ ] [Phase 6 — Cyber Blue Team (detection)](#phase-6--cyber-blue-team-detection)
-- [ ] [Phase 7 — Cyber Red Team (attack)](#phase-7--cyber-red-team-attack)
-- [ ] [Phase 8 — Virtual network segmentation](#phase-8--virtual-network-segmentation)
-- [ ] [Phase 9 — Moving to real hardware](#phase-9--moving-to-real-hardware)
-- [ ] [Phase 10 — HID injection](#phase-10--hid-injection)
+- [x] [Phase 0 - Setup](#phase-0--setup)
+- [x] [Phase 1 - First virtual network](#phase-1--first-virtual-network)
+- [x] [Phase 2 - Network servers (DHCP/DNS)](#phase-2--network-servers)
+- [ ] [Phase 3 - Routing](#phase-3--routing)
+- [ ] [Phase 4 - Firewall](#phase-4--firewall)
+- [ ] [Phase 5 - Active Directory](#phase-5--active-directory)
+- [ ] [Phase 6 - Cyber Blue Team (detection)](#phase-6--cyber-blue-team-detection)
+- [ ] [Phase 7 - Cyber Red Team (attack)](#phase-7--cyber-red-team-attack)
+- [ ] [Phase 8 - Virtual network segmentation](#phase-8--virtual-network-segmentation)
+- [ ] [Phase 9 - Moving to real hardware](#phase-9--moving-to-real-hardware)
+- [ ] [Phase 10 - HID injection](#phase-10--hid-injection)
 
 ---
 
-# Phase 0 — Setup
+# Phase 0 - Setup
 
 **Goal:** understand the environment before building anything.
 
 **Tools and hardware:** Debian PC, Incus, Wireshark, tcpdump, systemd-networkd, systemd-resolved.
 
-## Step 0.1 — Understanding the host machine
+## Step 0.1 - Understanding the host machine
 
 Basic exploration of the host's network configuration: interface, IP address, gateway, DNS.
 
 **What I observed and understood:**
 - The difference between the network address (`.0`), the broadcast address (the last address of the block, `.255` for a `/24`), and the usable host addresses.
 - Name resolution goes through `systemd-resolved`, which forwards requests to whichever DNS server is configured.
-- The gateway is usually, by convention, the first address of the network (`.1`) — but that's just a convention, not a rule.
+- The gateway is usually, by convention, the first address of the network (`.1`) - but that's just a convention, not a rule.
 - The difference between a `scope link` route (directly reachable local network) and a `via` route (reachable through a gateway).
 
 Key commands:
@@ -43,7 +43,7 @@ resolvectl status
 
 ![Host network configuration output](assets/config-net-hote.png)
 
-## Step 0.2 — Understanding Incus
+## Step 0.2 - Understanding Incus
 
 **Goal:** get familiar with Incus's core concepts before creating any instance.
 
@@ -74,18 +74,18 @@ incus profile list
 
 ---
 
-# Phase 1 — First virtual network
+# Phase 1 - First virtual network
 
 **Goal:** understand how machines communicate with each other.
 
-## Step 1.1 — Create a network
+## Step 1.1 - Create a network
 
 ```text
 Name   : lab-net
 Subnet : 10.10.1.0/24
 ```
 
-## Step 1.2 — First container (`debian1`)
+## Step 1.2 - First container (`debian1`)
 
 ```bash
 incus shell debian1
@@ -94,7 +94,7 @@ ip a
 
 ![debian1 IPv4 address](assets/ipa-deb1.png)
 
-## Step 1.3 — Second container (`debian2`)
+## Step 1.3 - Second container (`debian2`)
 
 ```bash
 incus shell debian2
@@ -193,11 +193,11 @@ sudo tcpdump -i wlo1 icmp -n
 
 ---
 
-# Phase 2 — Network servers
+# Phase 2 - Network servers
 
 **Goal:** set up DHCP and DNS so machines on the network can communicate without any manual configuration.
 
-## Step 2.1 — Create a profile
+## Step 2.1 - Create a profile
 
 ```text
 Name        : lab-limits
@@ -213,7 +213,7 @@ incus profile edit lab-limits < lab-limits.yaml
 
 Config file: [`lab-limits.yaml`](configs/lab-limits.yaml)
 
-## Step 2.2 — Create a project
+## Step 2.2 - Create a project
 
 ```text
 Name        : lab-srv
@@ -225,7 +225,7 @@ incus project create lab-srv --config features.profiles=false
 incus project switch lab-srv
 ```
 
-## Step 2.3 — Create a network
+## Step 2.3 - Create a network
 
 DHCP and DNS built into Incus are disabled on this network, so my own servers are the ones handling address assignment and name resolution.
 
@@ -242,7 +242,7 @@ incus network create lab-net1 ipv4.address=10.114.22.1/24 ipv4.nat=true ipv4.dhc
 
 ![lab-net1 network](assets/network-lab-net1.png)
 
-## Step 2.4 — DHCP server
+## Step 2.4 - DHCP server
 
 ```text
 Machine  : dhcp-server
@@ -282,7 +282,7 @@ Full config file: [kea-dhcp4.conf](configs/kea-dhcp4.conf)
 
 ---
 
-## Step 2.5 — DNS server
+## Step 2.5 - DNS server
 
 ```text
 Machine  : dns-server
@@ -342,70 +342,70 @@ Local reverse resolution:
 
 ---
 
-## Step 2.6 — DHCP and DNS together
+## Step 2.6 - DHCP and DNS together
 
 ![DHCP and DNS servers](assets/serveurs.png)
 
 ---
 
-# Phase 3 — Routing
+# Phase 3 - Routing
 
 **Goal:** understand the role of a router.
 
-## Step 3.1 — Linux router (nftables) — practice
-## Step 3.2 — Two networks
-## Step 3.3 — NAT
-## Step 3.4 — pfSense — adopted router
+## Step 3.1 - Linux router (nftables) - practice
+## Step 3.2 - Two networks
+## Step 3.3 - NAT
+## Step 3.4 - pfSense - adopted router
 
 
 ---
 
-# Phase 4 — Firewall
+# Phase 4 - Firewall
 
 **Goal:** control traffic, not just route it.
 
-## Step 4.1 — nftables rules — practice
-## Step 4.2 — Observing with Wireshark
-## Step 4.3 — DROP vs REJECT
-## Step 4.4 — pfSense — adopted firewall
-## Step 4.5 — Equivalent rules in pfSense
-## Step 4.6 — DROP vs REJECT in pfSense
+## Step 4.1 - nftables rules - practice
+## Step 4.2 - Observing with Wireshark
+## Step 4.3 - DROP vs REJECT
+## Step 4.4 - pfSense - adopted firewall
+## Step 4.5 - Equivalent rules in pfSense
+## Step 4.6 - DROP vs REJECT in pfSense
 
 ---
 
-# Phase 5 — Active Directory
+# Phase 5 - Active Directory
 
 **Goal:** understand the most common enterprise network environment.
 
-## Step 5.1 — Domain controller
-## Step 5.2 — Client machine
-## Step 5.3 — GPO
-## Step 5.4 — Low-privilege user
+## Step 5.1 - Domain controller
+## Step 5.2 - Client machine
+## Step 5.3 - GPO
+## Step 5.4 - Low-privilege user
 
 ---
 
-# Phase 6 — Cyber Blue Team (detection)
+# Phase 6 - Cyber Blue Team (detection)
 
 **Goal:** be able to detect attacks before launching them myself.
 
-## Step 6.1 — Wazuh
-## Step 6.2 — Sysmon
-## Step 6.3 — Suricata
-## Step 6.4 — Suricata on Raspberry Pi
+## Step 6.1 - Wazuh
+## Step 6.2 - Sysmon
+## Step 6.3 - Suricata
+## Step 6.4 - Suricata on Raspberry Pi
 
 ---
 
-# Phase 7 — Cyber Red Team (attack)
+# Phase 7 - Cyber Red Team (attack)
 
 **Goal:** generate real attack traffic.
 
-## Step 7.1 — Reconnaissance
-## Step 7.2 — Cross-checking
-## Step 7.3 — Exploitation and report
+## Step 7.1 - Reconnaissance
+## Step 7.2 - Cross-checking
+## Step 7.3 - Exploitation and report
 
 ---
 
-# Phase 8 — Virtual network segmentation
+# Phase 8 - Virtual network segmentation
 
 **Goal:** build a real enterprise-style architecture, with a final addressing scheme.
 
@@ -422,21 +422,21 @@ DMZ     : 10.114.22.192/26  (10.114.22.193 - 10.114.22.254)
 
 ---
 
-# Phase 9 — Moving to real hardware
+# Phase 9 - Moving to real hardware
 
 **Hardware:** managed switch, router, Raspberry Pi.
 
-## Step 9.1 — VLANs on the real switch
-## Step 9.2 — Trunk (802.1Q)
-## Step 9.3 — Router-on-a-stick
-## Step 9.4 — ACLs on the real switch/router
-## Step 9.5(optionnal) — Secure remote access (VPN)
+## Step 9.1 - VLANs on the real switch
+## Step 9.2 - Trunk (802.1Q)
+## Step 9.3 - Router-on-a-stick
+## Step 9.4 - ACLs on the real switch/router
+## Step 9.5(optionnal) - Secure remote access (VPN)
 
 ---
 
-# Phase 10 — HID injection
+# Phase 10 - HID injection
 
-## Step 10.1 — Arduino: HID injection (BadUSB)
+## Step 10.1 - Arduino: HID injection (BadUSB)
 
 ---
 
