@@ -1,0 +1,31 @@
+// Autoriser uniquement nos réseaux à solliciter ce DNS
+acl "homelab-lan" {
+        10.114.22.0/24;
+        localhost;
+	// autre réseau ici 
+	// localnets : contient tous les réseaux connecté aux interfaces réseau du serveur
+};
+
+
+options {
+        // Répertoire de travail de Bind
+        directory "/var/cache/bind";
+
+        // Redirecteurs DNS (résolveurs externes: passant par le serveur récursif de cloudfare family)
+        forwarders {
+                1.1.1.3;
+                1.0.0.3;
+        };
+
+        // Permet le mode récursif
+        recursion yes;
+
+        // Active la validation DNSSEC (vérifier l'authenticité des réponses DNS signées)
+        dnssec-validation auto;
+
+        // Ecouter sur toutes les interfaces réseau en IPv4 
+        listen-on { any; };
+
+        // Activer le serveur dns que pour les machines définie dans la section acl
+        allow-query { homelab-lan; };
+};

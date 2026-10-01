@@ -1,0 +1,12 @@
+config:
+  limits.cpu: "2"   # nombre de cœurs
+  limits.cpu.allowance: "50%"  # % de temps CPU (throttling)
+  limits.cpu.priority: "5"    # priorité relative si contention (0-10)
+  limits.memory: "512MiB"    
+  limits.memory.enforce: hard  # hard = kill si dépassement, soft = tolère un peu
+  limits.memory.swap: "false"   # interdit le swap pour ce conteneur
+  limits.processes: "100"     # limits le nombre de processes en multithreading
+description: "Profil de limitation CPU/RAM/processus pour le lab"
+devices: {}
+name: lab-limits
+used_by: []

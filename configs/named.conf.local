@@ -1,0 +1,25 @@
+//
+// Do any local configuration here
+//
+
+zone "homelab.local" {
+    type master;
+    file "/etc/bind/db.homelab.local";
+    allow-update { none; };
+};
+
+zone "22.114.10.in-addr.arpa" {
+    type master;
+    file "/etc/bind/db.reverse.homelab.local";
+    allow-update { none; };
+};
+// in-addr.arpa est un espace de noms réservé et communément utilisé pour la résolution inverse
+
+
+
+
+
+
+
+
+

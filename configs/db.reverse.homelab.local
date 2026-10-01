@@ -1,0 +1,15 @@
+; BIND data file for it-connect.local
+$TTL    604800
+@       IN      SOA     dns-server.homelab.local. thalesnanaofficiel.gmail.com. (
+                              1         ; Serial
+                         604800         ; Refresh
+                          86400         ; Retry
+                        2419200         ; Expire
+                         604800 )       ; Negative Cache TTL
+;
+@               IN      NS      dns-server.homelab.local.
+1     		IN      PTR     router.homelab.local
+2 		IN	PTR	dhcp-server.homelab.local
+3		IN	PTR	dns-server.homelab.local
+
+
