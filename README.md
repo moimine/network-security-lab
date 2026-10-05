@@ -53,12 +53,11 @@ apt install incus
 incus admin init
 ```
 
-Added my user to the `incus-admin` group, so I can manage Incus without using `sudo` every time.
-
 **Concepts covered:**
 - **Storage pool vs storage volume** : the pool is the total physical space available to all instances; a volume is the portion of that space dedicated to a specific instance.
 - **Profile** : a reusable configuration template, applied to one or more instances to avoid repeating the same settings on every creation.
 - **Project** : an isolation space, used to keep groups of instances, networks, and profiles separate within a single Incus host.
+- **Network** : a managed bridge that instances connect to in order to communicate with each other and the outside world. By default, `incus admin init` creates one such bridge (`incusbr0`), used automatically unless another network is specified.
 - **Built-in network stack** : Incus runs a `dnsmasq` service by default, acting as both DHCP and DNS server on every network it creates.
 - **Hypervisor** : Incus VMs run on KVM, the Linux kernel's native hypervisor.
 
@@ -69,8 +68,13 @@ incus project list
 incus network list
 incus profile list
 ```
+Storage list :
 
 ![Output of incus storage list](assets/incus-storage-list.png)
+
+Network list :
+
+![Output of network list](assets/incus-network-list.png)
 
 ---
 
@@ -353,6 +357,49 @@ Local reverse resolution:
 **Goal:** understand the role of a router.
 
 ## Step 3.1 - Linux router (nftables) - practice
+
+```text
+Machine  : router1
+IP (LAN) : 10.114.22.1 (static, see below)
+```
+
+```bash
+incus launch images:debian/13 router1 --vm --profile default --profile lab-limits
+```
+
+**WAN interface - macvlan attempt (failed):**
+
+Macvlan was tried first for a direct WAN connection (via `wlo1`), but failed: Wi-Fi only allows one MAC address per radio association, so the router's virtual MAC could never complete its own DHCP negotiation.
+
+```bash
+incus config device add router1 eth1 nic nictype=macvlan parent=wlo1
+```
+
+![DORA failure](assets/dora-fail.png)
+
+**Current solution — Incus's managed bridge (`incusbr0`):**
+
+Switched to `incusbr0` + NAT instead, which works reliably. A traceroute from behind `router1` confirms the double NAT in place (one hop for `router1` itself, one more for the host's bridge, before reaching the real gateway).
+
+```bash
+incus config device remove router1 eth1
+incus config device add router1 eth1 nic nictype=bridged parent=incusbr0
+incus network set incusbr0 ipv4.nat=true
+incus network set lab-net1 ipv4.nat=false
+```
+
+**Note:** NAT is disabled on `lab-net1` because `router1` now handles NAT itself for its LAN, having NAT enabled at both the bridge and the router would create a redundant double translation for no benefit.
+
+### Static IP configuration for the LAN interface (`enp5s0`)
+
+`router1`'s LAN interface is configured with a static address (`10.114.22.1/24`) via `systemd-networkd`, so it can act as a stable, predictable gateway for the network rather than depending on DHCP itself.
+
+Config file: [`router1-enp5s0.network`](configs/router1-enp5s0.network)
+
+![router1 LAN interface, static IP](assets/router1-ipa.png)
+
+**Planned improvement:** retry macvlan over a wired Ethernet connection once available, to get closer to the real hardware setup from Phase 9.
+
 ## Step 3.2 - Two networks
 ## Step 3.3 - NAT
 ## Step 3.4 - pfSense - adopted router
