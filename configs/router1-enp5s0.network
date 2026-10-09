@@ -2,5 +2,7 @@
 Name=enp5s0
 
 [Network]
-Address=10.114.22.1/24
-DHCP=false
+VLAN=enp5s0.10
+VLAN=enp5s0.20
+VLAN=enp5s0.30
+VLAN=enp5s0.40

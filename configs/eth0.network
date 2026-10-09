@@ -2,8 +2,8 @@
 Name=eth0
 
 [Network]
-Address=10.114.22.2/24
+Address=10.114.22.2/26
+Gateway=10.114.22.1
 DHCP=false
-
 [DHCP]
 ClientIdentifier=mac

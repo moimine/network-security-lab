@@ -1,0 +1,12 @@
+[Unit]
+Description=Enable VLAN filtering on Incus lab-net1 bridge
+After=incus.service
+Requires=incus.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ip link set dev lab-net1 type bridge vlan_filtering 1
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
