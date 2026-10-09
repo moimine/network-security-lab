@@ -7,7 +7,7 @@ Network, virtualization & cybersecurity homelab: DHCP, DNS, routing, VLAN segmen
 - [x] [Phase 0 - Setup](#phase-0--setup)
 - [x] [Phase 1 - First virtual network](#phase-1--first-virtual-network)
 - [x] [Phase 2 - Network servers (DHCP/DNS)](#phase-2--network-servers)
-- [ ] [Phase 3 - Routing](#phase-3--routing)
+- [x] [Phase 3 - Routing](#phase-3--routing)
 - [ ] [Phase 4 - Firewall](#phase-4--firewall)
 - [ ] [Phase 5 - Active Directory](#phase-5--active-directory)
 - [ ] [Phase 6 - Cyber Blue Team (detection)](#phase-6--cyber-blue-team-detection)
