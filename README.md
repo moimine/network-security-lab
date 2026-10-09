@@ -7,7 +7,7 @@ Network, virtualization & cybersecurity homelab: DHCP, DNS, routing, VLAN segmen
 - [x] [Phase 0 - Setup](#phase-0--setup)
 - [x] [Phase 1 - First virtual network](#phase-1--first-virtual-network)
 - [x] [Phase 2 - Network servers (DHCP/DNS)](#phase-2--network-servers)
-- [x] [Phase 3 - Routing and VLAN Segmentation](#phase-3--routing-and-vlan-segmentation)
+- [x] [Phase 3 — Routing and VLAN Segmentation](#phase-3--routing-and-vlan-segmentation)
 - [ ] [Phase 4 - Firewall](#phase-4--firewall)
 - [ ] [Phase 5 - Active Directory](#phase-5--active-directory)
 - [ ] [Phase 6 - Cyber Blue Team (detection)](#phase-6--cyber-blue-team-detection)
@@ -655,23 +655,6 @@ ip -d link show lab-net1
 ## Step 7.1 - Reconnaissance
 ## Step 7.2 - Cross-checking
 ## Step 7.3 - Exploitation and report
-
----
-
-# Phase 8 - Virtual network segmentation
-
-**Goal:** build a real enterprise-style architecture, with a final addressing scheme.
-
-## Planned addressing scheme
-
-`10.114.22.0/24` split into four `/26` subnets (64 addresses each):
-
-```text
-ADMIN   : 10.114.22.0/26    (10.114.22.1   - 10.114.22.62)
-USERS   : 10.114.22.64/26   (10.114.22.65  - 10.114.22.126)
-SERVERS : 10.114.22.128/26  (10.114.22.129 - 10.114.22.190)
-DMZ     : 10.114.22.192/26  (10.114.22.193 - 10.114.22.254)
-```
 
 ---
 
