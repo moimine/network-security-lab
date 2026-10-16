@@ -238,12 +238,12 @@ Description : lab network, 10.114.22.0/24, no built-in DHCP/DNS, domain homelab.
 ```
 
 ```bash
-incus network create lab-net1 ipv4.address=10.114.22.1/24 ipv4.nat=true ipv4.dhcp=false dns.mode=none dns.domain=lab.local
+incus network create lab-net1 ipv4.address=10.114.22.1/24 ipv4.nat=true ipv4.dhcp=false dns.mode=none dns.domain=homelab.local
 ```
 
 **Note:** the network lives in the `default` project and is shared with `lab-srv` (`features.networks=false`). Per-project network isolation in Incus requires OVN, which isn't needed here.
 
-![lab-net1 network](assets/network-lab-net1.png)
+![lab-net1 network](assets/network-labnet1.png)
 
 ## Step 2.4 - DHCP server
 
@@ -313,8 +313,8 @@ Zones are declared in `/etc/bind/named.conf.local`. This file tells bind9 which 
 **Zone config file:** [named.conf.local](configs/named.conf.local).
 
 Next, create and populate the zone files:
-- Forward zone: name-to-IP records (e.g. `google.com` → `8.8.8.8`).
-- Reverse zone: IP-to-name records (e.g. `8.8.8.8` → `google.com`).
+- Forward zone: name-to-IP records (e.g. dns-server.homelab.local → 10.114.22.3).
+- Reverse zone: IP-to-name records (e.g. 10.114.22.3 → dns-server.homelab.local).
 
 - Forward zone file: [db.homelab.local](configs/db.homelab.local).
 - Reverse zone file: [db.reverse.homelab.local](configs/db.reverse.homelab.local).
@@ -324,9 +324,11 @@ Next, create and populate the zone files:
 ```bash
 named-checkzone homelab.local /etc/bind/db.homelab.local
 named-checkzone 22.114.10.in-addr.arpa /etc/bind/db.reverse.homelab.local
-sudo systemctl start bind9
-sudo systemctl enable named.service
-sudo systemctl status bind9
+sudo systemctl enable --now named.service
+sudo systemctl status named.service
+
+# After a zone edit (increment the serial): reload the running server
+sudo rndc reload
 ```
 
 **Resolution test results with bind9:**
@@ -337,7 +339,7 @@ Resolution through the recursive resolver:
 
 Local reverse resolution:
 
-![Reverse resolution result via bind9](assets/resolution_inverse.png)
+![Reverse resolution result via bind9](assets/inverse-resolution.png)
 
 **Tutorial used as a reference:** [Setting up a DNS server with BIND9](https://www.it-connect.fr/dns-avec-bind-9/)
 
@@ -349,69 +351,47 @@ Local reverse resolution:
 
 ---
 
-# Phase 3 - Routing and VLAN Segmentation
+## Phase 3 - Routing and VLANs
 
-**Goal:** understand how a router connects networks, and how VLANs, DHCP, DNS and NAT fit together around it, using Incus and Linux.
+**Goal:** replace the Incus bridge as my network gateway with a real router (a VM), split the lab into four VLANs, and give every VLAN internet access through NAT.
 
-```text
-Machine  : router1
-OS       : Debian 13 (VM)
-Network  : systemd-networkd
-```
+> **Note:** the Phase 2 text above was written before the VLAN split. The lab network `10.114.22.0/24` is now divided into four `/26` subnets, so the `dhcp-server` and `dns-server` network settings must use a `/26` mask from now on.
 
----
+### Step 3.1 - Create the router VM
 
-## Step 3.1 - Deploy the router VM
-
-A router needs its own kernel and full control over its network stack, so `router1` is a VM rather than a container.
+I created a Debian 13 VM that will act as the router:
 
 ```bash
-incus launch images:debian/13 router1 \
-  --vm --project lab-srv \
-  --profile default --profile lab-limits
+incus launch images:debian/13 router1 --vm --project lab-srv --profile default --profile lab-limits
 ```
 
-It has two interfaces:
+It needs two interfaces: one on the lab network (`lab-net1`) and one toward the outside world.
 
-- **LAN** (`eth0`, `enp5s0` inside the VM): connected to `lab-net1`
-- **WAN** (`eth1`, `enp6s0` inside the VM): connected to the outside world
-
-### WAN interface: macvlan attempt (failed)
-
-I first tried macvlan on the host's Wi-Fi card (`wlo1`), to give the router a real IP on the physical network, closer to what I will have on real hardware in Phase 9.
-
-```bash
-incus config device add router1 eth1 nic nictype=macvlan parent=wlo1
-```
-
-It failed. A packet capture on `wlo1` showed the router's DHCP Discover leaving the host, but no Offer ever came back. Wi-Fi (802.11) only allows one MAC address per radio association, so the router's virtual MAC could never complete its own DHCP negotiation.
+My first idea was a `macvlan` NIC on the host's Wi-Fi interface (`wlo1`). It failed: the router never received a DHCP Offer.
 
 ![DORA failure](assets/dora-fail.png)
 
-### WAN interface: Incus managed bridge (`incusbr0`)
-
-I switched to `incusbr0`, the bridge Incus creates at `incus admin init`. It provides DHCP (through its built-in `dnsmasq`) and NAT toward the host's real interface.
+The reason is that a Wi-Fi association exposes a single MAC address, so frames from a second MAC (the macvlan) are dropped. I switched to a bridged NIC on `incusbr0`, which gives me NAT toward the host (a double NAT, but it works):
 
 ```bash
-incus config device remove router1 eth1
-incus config device add router1 eth1 nic \
-  nictype=bridged parent=incusbr0 --project lab-srv
+incus config device add router1 eth1 nic nictype=bridged parent=incusbr0 --project lab-srv
 incus network set incusbr0 ipv4.nat=true
 incus network set lab-net1 ipv4.nat=false
 ```
 
-NAT is disabled on `lab-net1` because `router1` handles NAT itself for its LAN. Keeping it on at both the bridge and the router would only add a redundant translation.
+`lab-net1` no longer does NAT: the router will do it. I'll retry macvlan later over Ethernet.
 
-**Planned improvement:** retry macvlan over a wired Ethernet connection once I have a cable. Ethernet, unlike Wi-Fi, supports several MAC addresses on the same link, which should remove the limitation.
+### Step 3.2 - Static address for the LAN side (inside `router1`)
 
----
+The router needs a fixed address on the LAN. I want it to be `10.114.22.1`, but this address is currently used by the Incus bridge. So I moved the bridge to another address, **on the host**:
 
-## Step 3.2 - Static IP on the LAN interface
+```bash
+incus network set lab-net1 ipv4.address=10.114.22.254/24
+```
 
-At first the LAN was a flat `/24`. The router's LAN interface uses a static address, so it can act as a stable gateway instead of depending on DHCP itself (the DHCP server itself needs the router, so a DHCP-assigned router address would be circular).
+Then, **inside `router1`**, I configured `enp5s0` statically with systemd-networkd (`/etc/systemd/network/enp5s0.network`):
 
 ```ini
-# /etc/systemd/network/enp5s0.network
 [Match]
 Name=enp5s0
 
@@ -420,21 +400,13 @@ Address=10.114.22.1/24
 DHCP=false
 ```
 
-Before this, `.1` had to be freed on the Incus side, since the bridge itself was holding it:
+Full file: [configs/router1/network/enp5s0.network](configs/enp5s0.network)
 
-```bash
-incus network set lab-net1 ipv4.address=10.114.22.254/24
-```
+![router1 IP addresses](assets/router1-ipa.png)
 
-![router1 LAN interface, static IP](assets/router1-ipa.png)
+### Step 3.3 - Make the bridge VLAN-aware (on the host)
 
-This flat configuration is replaced by the VLAN setup in Step 3.4.
-
----
-
-## Step 3.3 - Make the bridge VLAN-aware
-
-To carry several VLANs over one link, `lab-net1` has to behave like a managed switch. I enabled VLAN filtering on the host bridge and allowed the tagged VLANs on the router's LAN interface.
+By default the Incus bridge ignores VLAN tags. I enabled VLAN filtering on it and allowed the tags on the router's port:
 
 ```bash
 sudo ip link set dev lab-net1 type bridge vlan_filtering 1
@@ -444,57 +416,36 @@ incus config device set router1 eth0 vlan.tagged "10,20,30,40" --project lab-srv
 Verification:
 
 ```bash
-ip -d link show lab-net1
+ip -d link show lab-net1 | grep -oE 'vlan_filtering [0-9]+|vlan_protocol [0-9.A-Za-z]+'
 sudo bridge vlan show
 ```
 
-![`Output of bridge vlan show`](assets/bridge-vlan.png)
+![Bridge VLAN filtering](assets/bridge-vlan-filtering.png)
 
-### Making it persistent across host reboots (on the host)
+The router's port (its `tap` interface, found with `incus config get router1 volatile.eth0.host_name --project lab-srv`) now carries VLANs 10, 20, 30 and 40.
 
-The `ip link` change does not survive a reboot, so I wrapped it in a systemd service that waits for the bridge to exist.
+**Persistence:** the `ip link set` command is lost at reboot, so I wrapped it in a systemd service on the host, with a drop-in override:
 
-- Service file: [`lab-net1-vlan.service`](configs/host/lab-net1-vlan.service)
-- Wait-for-bridge override: [`override.conf`](configs/host/lab-net1-vlan.service.d/override.conf)
+- [configs/host/lab-net1-vlan.service](configs/lab-net1-vlan.service)
+- [configs/host/lab-net1-vlan.service.d/override.conf](configs/lab-net1-vlan.service.d/override.conf)
 
+### Step 3.4 - VLAN interfaces (inside `router1`)
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now lab-net1-vlan.service
-systemctl status lab-net1-vlan.service --no-pager
-```
+Each VLAN gets its own subnet and its own sub-interface on the router:
 
----
+| VLAN | Name | Router address |
+|---|---|---|
+| 10 | ADMIN | 10.114.22.1/26 |
+| 20 | USERS | 10.114.22.65/26 |
+| 30 | SERVERS | 10.114.22.129/26 |
+| 40 | DMZ | 10.114.22.193/26 |
 
-## Step 3.4 - Configure the VLAN interfaces on the router
+`enp5s0.network` now declares the four VLANs (`VLAN=enp5s0.10`, `VLAN=enp5s0.20`, `VLAN=enp5s0.30`, `VLAN=enp5s0.40`), and each VLAN needs a `.netdev` (the interface) and a `.network` (its address).
 
-The LAN interface `enp5s0` now carries four 802.1Q VLANs, each with its own logical interface, gateway and `/26` subnet carved out of `10.114.22.0/24`.
-
-| VLAN | Interface | Router IP | Subnet | Purpose |
-|---|---|---|---|---|
-| 10 | `enp5s0.10` | `10.114.22.1/26` | `10.114.22.0/26` | ADMIN |
-| 20 | `enp5s0.20` | `10.114.22.65/26` | `10.114.22.64/26` | USERS |
-| 30 | `enp5s0.30` | `10.114.22.129/26` | `10.114.22.128/26` | SERVERS |
-| 40 | `enp5s0.40` | `10.114.22.193/26` | `10.114.22.192/26` | DMZ |
-
-First, the parent interface declares the VLANs (this replaces the static `/24` file from Step 3.2):
+Example for VLAN 10:
 
 ```ini
-# /etc/systemd/network/enp5s0.network
-[Match]
-Name=enp5s0
-
-[Network]
-VLAN=enp5s0.10
-VLAN=enp5s0.20
-VLAN=enp5s0.30
-VLAN=enp5s0.40
-```
-
-Then one `.netdev` and one `.network` file per VLAN (example for VLAN 10; the others only change the name, the ID and the address):
-
-```ini
-# /etc/systemd/network/vlan10.netdev
+# enp5s0.10.netdev
 [NetDev]
 Name=enp5s0.10
 Kind=vlan
@@ -504,7 +455,7 @@ Id=10
 ```
 
 ```ini
-# /etc/systemd/network/vlan10.network
+# enp5s0.10.network
 [Match]
 Name=enp5s0.10
 
@@ -512,32 +463,20 @@ Name=enp5s0.10
 Address=10.114.22.1/26
 ```
 
-The WAN interface asks for its address by DHCP:
+VLANs 20, 30 and 40 follow exactly the same pattern with their own ID and address. All the files are in [configs repertory/](configs/).
 
-```ini
-# /etc/systemd/network/enp6s0.network
-[Match]
-Name=enp6s0
-
-[Network]
-DHCP=ipv4
-```
+The WAN interface `enp6s0` simply asks for an address (`DHCP=ipv4`). Then:
 
 ```bash
 systemctl enable --now systemd-networkd
 systemctl restart systemd-networkd
 ```
 
-**Result:** each VLAN has its own gateway on `router1`, and the WAN interface gets its address from `incusbr0`.
+### Step 3.5 - Enable routing (inside `router1`)
 
----
+A Linux machine does not forward packets between interfaces by default. I enabled it permanently in `/etc/sysctl.d/99-router.conf`:
 
-## Step 3.5 - Enable IPv4 forwarding
-
-By default Linux drops packets that are not addressed to it. `ip_forward` tells the kernel to pass them from one interface to another, which is what makes it a router.
-
-```ini
-# /etc/sysctl.d/99-router.conf
+```
 net.ipv4.ip_forward=1
 ```
 
@@ -545,71 +484,114 @@ net.ipv4.ip_forward=1
 sysctl --system
 ```
 
----
+File: [configs/router1/99-router.conf](configs/99-router.conf)
 
-## Step 3.6 - NAT with nftables
+### Step 3.6 - NAT with nftables (inside `router1`)
 
 ```bash
-apt update
 apt install nftables
 ```
 
-Full ruleset: [`nftables.conf`](configs/nftables.conf)
+The ruleset accepts forwarded traffic and masquerades everything leaving through the WAN interface (`enp6s0`) from the lab range. 
 
-- The `forward` chain lets routed traffic through.
-- The `postrouting` rule masquerades packets from the lab subnet when they leave through `enp6s0`: the source address is replaced by the WAN interface's address, so private lab addresses can reach the outside.
+File: [configs/router1/nftables.conf](configs/nftables.conf)
 
 ```bash
 nft -c -f /etc/nftables.conf
 systemctl enable --now nftables
 ```
 
-**Security note:** the forwarding policy is deliberately permissive so I can validate routing first. Restricting traffic between VLANs with explicit rules is the subject of Phase 4.
+> **Security note:** this ruleset is deliberately permissive (everything is forwarded). It's only here to prove routing works. Phase 4 will turn it into a real firewall policy.
 
----
+### Step 3.7 - DHCP relay for the VLANs (inside `router1`)
 
-## Step 3.7 - Validation
-
-Router state:
+DHCP Discover messages are broadcasts, so they never cross a router. My Kea server (`10.114.22.2`) is in VLAN 10 and the clients in other VLANs can't reach it directly. I installed a relay on the router that forwards DHCP requests to Kea:
 
 ```bash
-incus exec router1 -- ip -br addr
-incus exec router1 -- ip route
-incus exec router1 -- sysctl net.ipv4.ip_forward
-incus exec router1 -- nft list ruleset
+apt install dhcp-helper
 ```
 
-Client side (DHCP lease, IP connectivity, DNS):
+with the server set to `10.114.22.2` (running as `dhcp-helper -r /run/dhcp-helper.pid -s 10.114.22.2`).
+
+On the Kea side, there is now one `subnet4` entry per VLAN (each with its own `id`, pool, and `routers` option pointing to the router address of that VLAN). File: [configs/kea-dhcp4.conf](configs/kea-dhcp4.conf)
+
+### Step 3.8 - Place the machines in their VLANs (on the host)
+
+An untagged VLAN on a NIC makes the bridge put that machine's traffic into the given VLAN:
 
 ```bash
-incus exec client-iot -- ip -4 addr show eth0
-incus exec client-users -- ping -c 3 10.114.22.65
-incus exec client-users -- ping -c 3 1.1.1.1
-incus exec client-users -- nslookup dns-server.homelab.local
+incus config device override dhcp-server eth0 vlan=10 --project lab-srv
+incus config device override dns-server eth0 vlan=10 --project lab-srv
+incus config device override client-users eth0 vlan=20 --project lab-srv
+incus config device override client-servers eth0 vlan=30 --project lab-srv
+incus config device override client-iot eth0 vlan=40 --project lab-srv
+incus restart dhcp-server dns-server client-users client-servers client-iot --project lab-srv
 ```
 
-![`Test DHCP and DNS`](assets/router1-enp5s0.png)
+| Machine | VLAN | Subnet |
+|---|---|---|
+| dhcp-server, dns-server | 10 (ADMIN) | 10.114.22.0/26 |
+| client-users | 20 (USERS) | 10.114.22.64/26 |
+| client-servers | 30 (SERVERS) | 10.114.22.128/26 |
+| client-iot | 40 (DMZ) | 10.114.22.192/26 |
 
-VLAN configuration on the host:
+![List of instances](assets/incus-list.png)
+
+### Step 3.9 - Validation
+
+**Router state** (inside `router1`):
+
+```bash
+ip -br addr
+ip route
+sysctl net.ipv4.ip_forward
+nft list ruleset
+```
+
+![Interfaces and routing tables](assets/router1-state.png)
+
+**Bridge ports** (on the host): each container's port is in its own VLAN, untagged (PVID), and the router's port carries all four tags.
 
 ```bash
 sudo bridge vlan show
-ip -d link show lab-net1
 ```
 
-![`VLAN configuration on the host`](assets/router1-enp5s0.png)
+![`VLAN configuration on the host`](assets/bridge-vlan-ports.png)
 
-### Results
+**From a client** (example with `client-users`):
 
-- Four separate IPv4 subnets, each with its own VLAN gateway on `router1`.
-- `router1` connects the internal lab network to the upstream network.
-- DHCP assigns addresses and network options to clients.
-- Internal and external DNS resolution both work.
-- Clients in the users and servers VLANs reach the Internet.
-- NAT is done by `router1`; it is disabled on `lab-net1` to avoid a redundant translation.
+```bash
+incus exec client-users --project lab-srv -- ip -4 addr show eth0
+incus exec client-users --project lab-srv -- ping -c 2 10.114.22.65
+incus exec client-users --project lab-srv -- ping -c 2 1.1.1.1
+incus exec client-users --project lab-srv -- nslookup dns-server.homelab.local
+incus exec client-users --project lab-srv -- nslookup google.com
+```
 
-**traceroute from a client :** 
-![`traceroute from client-users`](assets/router1-enp5s0.png)
+![DHCP lease, connectivity and DNS tests from the VLAN clients](assets/client-connectivity-tests.png)
+
+I ran the same checks on `client-servers` and `client-iot`.
+
+**Results:**
+
+- Each client gets an address in the `/26` of its own VLAN, through the relay.
+- Each client reaches its gateway (the router's address in its VLAN).
+- Each client reaches the internet (`1.1.1.1`).
+- Internal names (`dns-server.lab.local`) and external names (`google.com`) both resolve.
+
+**Path to the internet:**
+
+```bash
+incus exec client-users --project lab-srv -- traceroute -n -w 1 -q 1 8.8.8.8
+```
+
+![Traceroute from client-users](assets/traceroute-client-users.png)
+
+- Hop 1: `router1` (`10.114.22.65`), the client's gateway.
+- Hop 2: `incusbr0` (`10.40.70.1`), the second bridge, which does the first NAT.
+- Hop 3: my home box (`192.168.1.1`), the second NAT.
+
+I use `-n` (no reverse DNS), `-w 1` (1 s timeout) and `-q 1` (one probe per hop) because the default BusyBox traceroute waits 3 seconds on every silent hop.
 
 ---
 
@@ -658,7 +640,7 @@ ip -d link show lab-net1
 
 ---
 
-# Phase 9 - Moving to real hardware
+# Phase 8 - Moving to real hardware
 
 **Hardware:** managed switch, router, Raspberry Pi.
 
@@ -670,9 +652,9 @@ ip -d link show lab-net1
 
 ---
 
-# Phase 10 - HID injection
+# Phase 9 - HID injection
 
-## Step 10.1 - Arduino: HID injection (BadUSB)
+## Step 9.1 - Arduino: HID injection (BadUSB)
 
 ---
 

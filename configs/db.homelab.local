@@ -1,7 +1,7 @@
-; BIND data file for it-connect.local
+; Zone direct pour 10.114.22.0/24 (homelab.local)
 $TTL    604800
-@       IN      SOA     dns-server.homelab.local. thalesnanaofficiel.gmail.com. (
-                              1         ; Serial
+@       IN      SOA     dns-server.homelab.local. hostmaster.homelab.local. (
+                              3         ; Serial
                          604800         ; Refresh
                           86400         ; Retry
                         2419200         ; Expire
