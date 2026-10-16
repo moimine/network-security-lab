@@ -577,7 +577,7 @@ I ran the same checks on `client-servers` and `client-iot`.
 - Each client gets an address in the `/26` of its own VLAN, through the relay.
 - Each client reaches its gateway (the router's address in its VLAN).
 - Each client reaches the internet (`1.1.1.1`).
-- Internal names (`dns-server.lab.local`) and external names (`google.com`) both resolve.
+- Internal names (`dns-server.homelab.local`) and external names (`google.com`) both resolve.
 
 **Path to the internet:**
 
