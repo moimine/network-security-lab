@@ -7,7 +7,7 @@ Network, virtualization & cybersecurity homelab: DHCP, DNS, routing, VLAN segmen
 - [x] [Phase 0 - Setup](#phase-0--setup)
 - [x] [Phase 1 - First virtual network](#phase-1--first-virtual-network)
 - [x] [Phase 2 - Network servers (DHCP/DNS)](#phase-2--network-servers)
-- [x] [Phase 3 — Routing and VLAN Segmentation](#phase-3--routing-and-vlan-segmentation)
+- [x] [Phase 3 - Routing and VLAN Segmentation](#phase-3--routing-and-vlan-segmentation)
 - [ ] [Phase 4 - Firewall](#phase-4--firewall)
 - [ ] [Phase 5 - Active Directory](#phase-5--active-directory)
 - [ ] [Phase 6 - Cyber Blue Team (detection)](#phase-6--cyber-blue-team-detection)
@@ -597,14 +597,128 @@ I use `-n` (no reverse DNS), `-w 1` (1 s timeout) and `-q 1` (one probe per hop)
 
 # Phase 4 - Firewall
 
-**Goal:** control traffic, not just route it.
+**Goal:** control the traffic that crosses `router1`, not just route it. Until now the router forwarded everything. In this phase I turn it into a firewall that only allows the flows I decided on.
 
-## Step 4.1 - nftables rules - practice
-## Step 4.2 - Observing with Wireshark
-## Step 4.3 - DROP vs REJECT
-## Step 4.4 - pfSense - adopted firewall
-## Step 4.5 - Equivalent rules in pfSense
-## Step 4.6 - DROP vs REJECT in pfSense
+I used nftables on `router1`. The full ruleset is here: [`nftables.conf`](configs/nftable_firewall.conf)
+
+## Step 4.1 - Write the policy before the rules
+
+Before typing any rule, I decided what each VLAN is allowed to do. A firewall starts from a written policy, not from rules typed at random.
+
+| From | To | Decision | Why |
+|---|---|---|---|
+| ADMIN | everywhere | allow | this is the administration VLAN, it needs to reach everything (the DNS server also needs the Internet for its forwarders) |
+| USERS | DNS server | allow | the DNS server sits in ADMIN, so without this exception users could not resolve any name |
+| USERS | rest of ADMIN | block | users have no reason to reach the infrastructure |
+| USERS | SERVERS | allow | users will need the services hosted there |
+| USERS | DMZ | block | |
+| USERS | Internet | allow | |
+| SERVERS | DNS server | allow | same reason as for users |
+| SERVERS | ADMIN, USERS, DMZ | block | a server should never start a connection toward the other zones |
+| SERVERS | Internet | allow | updates |
+| DMZ | DNS server | allow | otherwise the DMZ could not resolve names |
+| DMZ | ADMIN, USERS, SERVERS | block | the DMZ is the least trusted zone |
+| DMZ | Internet | allow | |
+
+Everything that is not explicitly allowed is blocked. Answers to allowed connections come back through the state tracking described below, so I never need a rule for the return path.
+
+## Step 4.2 - Structure of the ruleset
+
+The file has two tables and four chains.
+
+| Table | Chain | Default policy | Why |
+|---|---|---|---|
+| `inet filter` | `input` | drop | protects the router itself: only a few flows are useful to it |
+| `inet filter` | `forward` | drop | this is the real firewall, it filters what crosses the router between VLANs and toward the Internet |
+| `inet filter` | `output` | accept | the router sends its own legitimate traffic (DHCP relay, WAN lease, updates) and I have no reason to restrict it |
+| `ip nat` | `postrouting` | accept | NAT has to happen after the routing decision, when the outgoing interface is known |
+
+I used the `inet` family for filtering because the router also handles IPv6, so one table covers both versions. The NAT table is `ip` because I only translate IPv4 private addresses.
+
+At the top of the file I use `define` variables (interfaces, the DNS and DHCP servers, port numbers) so the rules stay readable and a change is made in one place.
+
+## Step 4.3 - Rules that are easy to forget
+
+Most of the work is in `forward`, but a few rules in `input` are needed or the lab silently breaks:
+
+- **DHCP (UDP 67) from the VLAN interfaces.** The DHCP relay on `router1` listens there. Without this rule, no client gets an address. It also covers the answers coming back from Kea.
+- **DHCP (UDP 68) on the WAN interface.** The router renews its own lease from `incusbr0`.
+- **ICMPv6 neighbor discovery.** IPv6 does not use ARP. It uses ICMPv6 messages instead, so blocking them breaks IPv6 on the router. ARP itself is never filtered by this table.
+- **Ping toward the router.** Useful to test each VLAN gateway.
+- **Established and related connections first.** Replies to allowed traffic are accepted before any other rule.
+
+The order of the rules matters, because the first match wins. In `forward`, the DNS exception for USERS and SERVERS comes **before** the block toward ADMIN. The DNS server lives in ADMIN, so the opposite order would cut name resolution for everybody.
+
+## Step 4.4 - Drop or reject
+
+Both verdicts block a packet, but the sender does not see the same thing:
+
+- `drop` discards the packet silently. The sender just waits until it times out. A scanner like `nmap` sees the port as filtered.
+- `reject` discards the packet and sends an error back (an ICMP message). The sender knows immediately that it is refused. A scanner sees the port as closed.
+
+I use `reject` for the blocks between my internal VLANs (USERS or SERVERS toward ADMIN, SERVERS toward USERS): a fast and clear answer is more useful when I debug my own lab. I use `drop` for everything involving the DMZ, because that zone is the least trusted and I do not want to give it any information about what exists behind the firewall.
+
+## Step 4.5 - Proving that a rule is really hit
+
+A ping that fails only shows that something blocked it, not which rule. To prove it, I added a `counter` to one rule, USERS to ADMIN, as an example:
+
+```
+iifname $USERS oifname $ADMIN counter reject
+```
+
+Then I read the counter before and after two pings from `client-users` to the DHCP server, all from the host with `incus exec`:
+
+```bash
+incus exec router1 --project lab-srv -- nft list chain inet filter forward | grep counter
+incus exec client-users --project lab-srv -- ping -c 2 10.114.22.2
+incus exec router1 --project lab-srv -- nft list chain inet filter forward | grep counter
+```
+
+![USERS to ADMIN rule counter going from 0 to 2 packets after two pings](assets/demo_nftable_firewall_reject.png)
+
+The counter goes from 0 to 2 packets (168 bytes, two ICMP packets of 84 bytes), so this exact rule stopped them.
+
+## Step 4.6 - Check, load and persist the ruleset
+
+In `router1`:
+
+```bash
+nft -c -f /etc/nftables.conf      # check the syntax only, nothing is applied
+nft -f /etc/nftables.conf         # load the file
+nft list ruleset                  # show what is really loaded, with the counters
+systemctl enable --now nftables   # load it now and at every boot
+systemctl status nftables --no-pager
+```
+
+Some notes about this:
+
+- `nft -c` prints nothing when the file is valid. I always run it before loading, because a mistake in a firewall file is easy to make.
+- The file starts with `flush ruleset`, so loading it replaces the previous ruleset entirely. This also resets the counters to zero.
+- `nft -f` only changes the rules in memory. Without `systemctl enable --now nftables`, the rules disappear at the next reboot. The service reads `/etc/nftables.conf` at startup.
+
+## Step 4.7 - Validation
+
+The blocked side is already proven by the counter in Step 4.5. To check the allowed side, I ran two commands from `client-users`, again from the host with `incus exec`:
+ 
+```bash
+incus exec client-users --project lab-srv -- ping -c 2 10.114.22.136
+incus exec client-users --project lab-srv -- nslookup google.com
+```
+ 
+![Allowed flows from client-users: ping to the SERVERS VLAN and a DNS lookup](assets/demo_nftable_firewall_accept.png)
+ 
+- The ping to `client-servers` (VLAN 30) works. Its TTL is 63, one less than the default 64, which shows the packet went through `router1`.
+- The DNS lookup works even though USERS cannot reach the rest of ADMIN. This confirms that the DNS exception placed before the block is doing its job.
+
+## Current limits
+
+- The `ADMIN` VLAN can reach everything, and `USERS` can reach all of `SERVERS`. When real services exist, I will restrict these to the ports they need.
+- Rules in `forward` only cover IPv4. IPv6 between VLANs and toward the Internet is blocked by the default policy.
+- I do not log blocked traffic yet. This will come with the monitoring phase.
+
+## Next
+
+I plan to rebuild the same policy on pfSense and compare it with this nftables version. I will also re-check these rules when I place all the machines in their final segments in Phase 8.
 
 ---
 
