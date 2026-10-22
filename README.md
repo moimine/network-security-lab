@@ -10,7 +10,7 @@ Network, virtualization & cybersecurity homelab: DHCP, DNS, routing, VLAN segmen
 - [x] [Phase 3 - Routing and VLAN Segmentation](#phase-3--routing-and-vlan-segmentation)
 - [x] [Phase 4 - Firewall](#phase-4--firewall)
 - [ ] [Phase 5 - Active Directory](#phase-5--active-directory)
-- [ ] [Phase 6 - Cyber Blue Team (detection)](#phase-6--cyber-blue-team-detection)
+- [ ] [Phase 6 - Cyber Blue Team (detection)](#phase-6--cyber-blue-team-detection) - Wazuh done, Sysmon/Suricata to come
 - [ ] [Phase 7 - Cyber Red Team (attack)](#phase-7--cyber-red-team-attack)
 - [ ] [Phase 8 - Moving to real hardware](#phase-9--moving-to-real-hardware)
 - [ ] [Phase 9 - HID injection](#phase-10--hid-injection)
@@ -738,11 +738,203 @@ I plan to rebuild the same policy on pfSense and compare it with this nftables v
 **Goal:** be able to detect attacks before launching them myself.
 
 ## Step 6.1 - Wazuh
+
+**Goal:** add a monitoring layer to the lab. I installed a Wazuh server, connected one agent to it, then triggered real events to check that they show up as alerts. Wazuh plays the role of a SIEM here: it collects logs and file events from the machines and turns them into alerts.
+
+Only the server and one agent are done in this sub-phase.
+
+### Step 6.1.1 - Architecture
+
+| Machine | Type | VLAN | Address | Role |
+|---|---|---|---|---|
+| `wazuh-server` | VM (Ubuntu 22.04) | 10 (ADMIN) | `DHCP address` | manager, indexer and dashboard (all-in-one) |
+| `linux-agent` | container (Ubuntu 22.04) | 20 (USERS) | `DHCP address` | monitored machine |
+
+The server is in ADMIN because it is part of the infrastructure. The agent is in USERS on purpose: its traffic has to cross `router1`, so the firewall from Phase 4 is really involved.
+
+The agent talks to the server on two ports:
+
+- `1515/tcp`: enrollment, once, when the agent registers itself.
+- `1514/tcp`: events, permanently.
+
+### Step 6.1.2 - Create the VM and the agent container
+
+I created both machines with `incus init`, then put each one in its VLAN with `vlan=<id>` on its NIC (same method as in Step 3.8), and finally started it with `incus start`.
+
+The server needs more disk and more resources than the rest of the lab (it runs the manager, the indexer and the dashboard together), so it does not use the shared `default` storage pool or a shared limits profile.
+
+`/home` is on its own partition, much bigger than the root filesystem, so instead of eating into `/`, I reserved the space there: an 80GB file acting as a loop device, formatted in `btrfs`, mounted at `/mnt/incus-btrfs`, with a dedicated subvolume for Incus to use as a storage pool:
+
+```bash
+sudo truncate -s 80G /home/incus-btrfs.img
+sudo mkfs.btrfs /home/incus-btrfs.img
+sudo mkdir -p /mnt/incus-btrfs
+sudo mount -o loop /home/incus-btrfs.img /mnt/incus-btrfs
+sudo btrfs subvolume create /mnt/incus-btrfs/pool
+incus storage create bigpool btrfs source=/mnt/incus-btrfs/pool
+```
+
+At first the file was mounted with a plain `mount -o loop` command, not through `/etc/fstab`, so it would not have survived a host reboot. I fixed this by adding it to `fstab`:
+
+```bash
+echo "/home/incus-btrfs.img /mnt/incus-btrfs btrfs loop,defaults,nofail 0 0" | sudo tee -a /etc/fstab
+sudo umount /mnt/incus-btrfs
+sudo mount -a
+sudo systemctl daemon-reload
+mount | grep incus-btrfs
+```
+
+`nofail` keeps the boot from hanging if the file is ever missing. `systemctl daemon-reload` is needed after editing `fstab` by hand, so systemd regenerates its mount units from the new entry.
+
+Then I created the VM on that pool, with a 50GB root disk (the pool itself has 80GB, the VM's disk is just capped at 50GB within it), placed it in VLAN 10, and set its CPU/RAM limits directly on the instance:
+
+```bash
+incus init images:ubuntu/22.04 wazuh-server --vm --project lab-srv
+incus config device override wazuh-server root pool=bigpool size=50GiB --project lab-srv
+incus config device override wazuh-server eth0 vlan=10 --project lab-srv
+incus config set wazuh-server limits.cpu 4 --project lab-srv
+incus config set wazuh-server limits.memory 6GiB --project lab-srv
+incus start wazuh-server --project lab-srv
+```
+
+The agent, as a container, stays on the default pool and default profile:
+
+```bash
+incus init images:ubuntu/22.04 linux-agent --network lab-net1 --project lab-srv 
+incus config device override linux-agent eth0 vlan=20 --project lab-srv
+incus start linux-agent --project lab-srv
+```
+
+### Step 6.1.3 - Install the server
+
+Inside the `wazuh-server` VM, I used the official all-in-one script:
+
+```bash
+curl -sO https://packages.wazuh.com/4.14/wazuh-install.sh
+sudo bash ./wazuh-install.sh -a
+```
+
+At the end, the script prints the `admin` password for the dashboard. It also creates `wazuh-install-files.tar`, which contains all the generated passwords. I never publish it: it is listed in `.gitignore`, and none of my screenshots show a password.
+
+The dashboard is available at `https://10.114.22.10`. To reach it from my host, I gave the host an address in VLAN 10 with a VLAN subinterface on the bridge:
+
+```bash
+sudo bridge vlan add dev lab-net1 vid 10 self
+sudo ip link add link lab-net1 name lab-net1.10 type vlan id 10
+sudo ip addr add 10.114.22.5/26 dev lab-net1.10
+sudo ip link set lab-net1.10 up
+```
+
+This access is **temporary**: it is lost at the next reboot of the host.
+
+### Step 6.1.4 - Open the firewall for the agent
+
+The agent is in USERS and the server is in ADMIN, so the Phase 4 policy blocks the connection by default (USERS can only reach the DNS server in ADMIN). I added a narrow exception in the `forward` chain, only for the Wazuh server and only for its two ports:
+
+```
+iifname $USERS ip daddr $WAZUH tcp dport { 1514, 1515 } counter accept
+```
+
+Updated file: [`nftables.conf`](configs/nftable_firewall.conf)
+
+### Step 6.1.5 - Install the agent
+
+In the `linux-agent` container, I downloaded the `.deb` package and installed it with the manager address and an agent name:
+
+```bash
+WAZUH_MANAGER='10.114.22.10' WAZUH_AGENT_NAME='linux-agent' dpkg -i ./wazuh-agent_4.14.9-1_amd64.deb
+systemctl daemon-reload
+systemctl enable --now wazuh-agent
+```
+
+The agent appeared as **active** in the dashboard (`agent.id: 001`).
+
+### Step 6.1.6 - Proof that the traffic crosses the firewall
+
+After the agent registered, I read the counter of the rule from the host:
+
+```bash
+incus exec router1 --project lab-srv -- nft list chain inet filter forward | grep 1514
+```
+
+![Firewall counter on the Wazuh rule](assets/nft-wazuh-counter.png)
+
+The counter shows **3 packets (180 bytes)**. It only counts the first packet of each connection (three SYN packets of 60 bytes): the rest of each connection is accepted earlier by the `ct state established,related` rule. So the agent really goes through the exception I wrote.
+
+### Step 6.1.7 - Test 1: failed SSH logins
+
+From inside `linux-agent`, I tried to log in 20 times with an account that does not exist:
+
+```bash
+for i in $(seq 10); do ssh -o BatchMode=yes -o StrictHostKeyChecking=no baduser@127.0.0.1; done
+```
+
+I ran the loop twice. Each attempt ends with `Permission denied`.
+
+In the dashboard (Threat Hunting, filtered on `linux-agent`), I got **20 alerts**, all of type "Authentication failure", and none of level 12 or above:
+
+| Alert | Level | Rule |
+|---|---|---|
+| `sshd: Attempt to login using a non-existent user` | 5 | 5710 |
+| `sshd: brute force trying to get access to the system` | 10 | 5712 |
+
+The level 5 rule fires on each attempt. The level 10 rule is a correlation: it fires when several failures happen in a short time. The alerts are also mapped to the PCI DSS requirements 10.2.4, 10.2.5, 10.6.1 and 11.4.
+
+![Wazuh alerts for the failed SSH logins](assets/wazuh-ssh-alerts.png)
+
+### Step 6.1.8 - Test 2: file integrity monitoring (FIM)
+
+FIM watches a folder and reports every change. In `/var/ossec/etc/ossec.conf` of the agent, I added this line inside the `<syscheck>` block:
+
+```xml
+<directories check_all="yes" realtime="yes">/root/test-fim</directories>
+```
+
+Then I restarted the agent and waited for the log line `Real-time file integrity monitoring started`:
+
+```bash
+mkdir -p /root/test-fim
+systemctl restart wazuh-agent
+grep -i "real-time" /var/ossec/logs/ossec.log
+```
+
+Finally I created, modified and deleted a file:
+
+```bash
+echo "hello" > /root/test-fim/a.txt
+echo "modifié" >> /root/test-fim/a.txt
+rm /root/test-fim/a.txt
+```
+
+Wazuh reported the three events:
+
+| Event | Rule | Level | Description |
+|---|---|---|---|
+| added | 554 | 5 | File added to the system. |
+| modified | 550 | 7 | Integrity checksum changed. |
+| deleted | 553 | 7 | File deleted. |
+
+![Wazuh FIM events for the test file](assets/wazuh-fim-events.png)
+
+### Current limits (Wazuh)
+
+- The Wazuh server address comes from DHCP (pool of VLAN 10). I still need to add a reservation in Kea so it never changes.
+- The host access to the dashboard (`lab-net1.10`) is not persistent.
+- Only one agent is connected, and only Linux logs and FIM are used. There are no custom rules and no active response yet.
+
+---
+
 ## Step 6.2 - Sysmon
+
 ## Step 6.3 - Suricata
+
 ## Step 6.4 - Suricata on Raspberry Pi
 
 ---
+
+## Next
+
+I plan to attack the lab from another machine (Phase 7) and check which of these actions Wazuh detects. Sysmon on a Windows endpoint and Suricata (including on the Raspberry Pi) are the next sub-phases to fill in.
 
 # Phase 7 - Cyber Red Team (attack)
 
