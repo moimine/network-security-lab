@@ -1117,10 +1117,6 @@ Note this GPO targets Finance and RH, not IT: it's IT's group being pushed onto 
 - The firewall exception for AD traffic is per-destination-IP (`$AD_DC`), not per-service-name - adding a second DC later means updating this rule by hand.
 - `RH-Confidential` is hosted directly on `ws-dc1` for lab simplicity; a file share should never live on a domain controller in production.
 
-## Next
-
-Phase 6 (Blue Team) comes next: Sysmon on the Windows clients and Suricata for network detection, both forwarding into Wazuh.
-
 ---
 
 # Phase 6 - Cyber Blue Team (detection)
