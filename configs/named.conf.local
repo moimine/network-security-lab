@@ -13,6 +13,13 @@ zone "22.114.10.in-addr.arpa" {
     file "/etc/bind/db.reverse.homelab.local";
     allow-update { none; };
 };
+
+zone "ad.homelab.local" {
+    type forward;
+    forward only;
+    forwarders { 10.114.22.6; };
+};
+
 // in-addr.arpa est un espace de noms réservé et communément utilisé pour la résolution inverse
 
 

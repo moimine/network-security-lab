@@ -727,6 +727,41 @@ I plan to rebuild the same policy on pfSense and compare it with this nftables v
 **Goal:** understand the most common enterprise network environment.
 
 ## Step 5.1 - Domain controller
+
+I started with the Windows Server evaluation ISO (free for 180 days, no account needed) from [microsoft.com/fr-fr/evalcenter/download-windows-server-2022](https://www.microsoft.com/fr-fr/evalcenter/download-windows-server-2022).
+
+Incus VMs use `virtio` devices for disk and network. Windows does not include `virtio` drivers by default, so the installer cannot see the virtual disk unless it is given them. I repacked the Windows ISO with `distrobuilder`, which injects the drivers directly into the installer image instead of loading them by hand during setup:
+
+```bash
+sudo apt install -y distrobuilder rsync wimtools genisoimage libwin-hivex-perl virt-viewer
+sudo distrobuilder --cache-dir ~/distrobuilder-cache repack-windows --windows-arch=amd64 SERVER_EVAL_x64FRE_fr-fr.iso SERVER_EVAL_x64FRE_fr-fr.incus.iso
+```
+
+`distrobuilder` downloads the virtio drivers itself when `--drivers` is not given.
+
+I redirected distrobuilder's working directory to `/home` with `--cache-dir` (the root filesystem is small).
+
+Then I created the VM: empty (no base image, since it boots from the ISO), on the `bigpool` storage pool, connected to the `lab-net1` switch in VLAN 10 (ADMIN), with the Windows ISO and a vTPM attached:
+
+```bash
+incus init ws-dc1 --empty --vm --project lab-srv -s bigpool
+incus config device set ws-dc1 root size=60GiB --project lab-srv
+incus config device override ws-dc1 eth0 vlan=10 --project lab-srv
+incus config device set ws-dc1 eth0 network=lab-net1 --project lab-srv
+incus config set ws-dc1 limits.cpu 4 --project lab-srv
+incus config set ws-dc1 limits.memory 6GiB --project lab-srv
+incus config device add ws-dc1 vtpm tpm --project lab-srv
+incus config device add ws-dc1 install disk source=/home/thales/Téléchargements/SERVER_EVAL_x64FRE_fr-fr.incus.iso boot.priority=10 --project lab-srv
+incus start ws-dc1 --console=vga --project lab-srv
+```
+
+A few notes from getting this right:
+
+- `incus console --type=vga` needs a SPICE client on the host (`virt-viewer`) to actually show a window; without it, it only prints a socket path.
+- a vTPM is a software-emulated TPM chip: it gives the VM a virtual version of the physical security chip that normally stores encryption keys and checks boot integrity (used by BitLocker, Windows Hello, and required by Windows 11). Windows Server does not require it, but I added one anyway in case AD DS or disk encryption needs it later.
+
+Not done yet: the actual Windows Server installation and promotion to domain controller.
+
 ## Step 5.2 - Client machine
 ## Step 5.3 - GPO
 ## Step 5.4 - Low-privilege user
@@ -747,8 +782,8 @@ Only the server and one agent are done in this sub-phase.
 
 | Machine | Type | VLAN | Address | Role |
 |---|---|---|---|---|
-| `wazuh-server` | VM (Ubuntu 22.04) | 10 (ADMIN) | `DHCP address` | manager, indexer and dashboard (all-in-one) |
-| `linux-agent` | container (Ubuntu 22.04) | 20 (USERS) | `DHCP address` | monitored machine |
+| `wazuh-server` | VM (Ubuntu 22.04) | 10 (ADMIN) | `10.114.22.10` (DHCP reservation) | manager, indexer and dashboard (all-in-one) |
+| `linux-agent` | container (Ubuntu 22.04) | 20 (USERS) | `10.114.22.72` (DHCP address) | monitored machine |
 
 The server is in ADMIN because it is part of the infrastructure. The agent is in USERS on purpose: its traffic has to cross `router1`, so the firewall from Phase 4 is really involved.
 
@@ -763,7 +798,7 @@ I created both machines with `incus init`, then put each one in its VLAN with `v
 
 The server needs more disk and more resources than the rest of the lab (it runs the manager, the indexer and the dashboard together), so it does not use the shared `default` storage pool or a shared limits profile.
 
-`/home` is on its own partition, much bigger than the root filesystem, so instead of eating into `/`, I reserved the space there: an 80GB file acting as a loop device, formatted in `btrfs`, mounted at `/mnt/incus-btrfs`, with a dedicated subvolume for Incus to use as a storage pool:
+`/home` is on its own partition, much bigger than the root filesystem, so instead of eating into `/`, I reserved the space there: a file acting as a loop device, formatted in `btrfs`, mounted at `/mnt/incus-btrfs`, with a dedicated subvolume for Incus to use as a storage pool:
 
 ```bash
 sudo truncate -s 80G /home/incus-btrfs.img
@@ -800,10 +835,45 @@ incus start wazuh-server --project lab-srv
 The agent, as a container, stays on the default pool and default profile:
 
 ```bash
-incus init images:ubuntu/22.04 linux-agent --network lab-net1 --project lab-srv 
+incus init images:ubuntu/22.04 linux-agent --network lab-net1 --project lab-srv
 incus config device override linux-agent eth0 vlan=20 --project lab-srv
 incus start linux-agent --project lab-srv
 ```
+
+The indexer (OpenSearch) later filled this 50GB quota faster than expected, which blocked the VM from even starting ("disk quota exceeded"). I raised the quota temporarily to look into it:
+
+```bash
+incus config device set wazuh-server root size=60GiB --project lab-srv
+```
+
+Then, inside the VM, I ran `fstrim` to reclaim space that deleted files were still holding on the host side (VM disks are thinly-provisioned and don't free host space on their own):
+
+```bash
+sudo fstrim -v /
+```
+
+This reclaimed about 27GB, bringing real usage down to ~31GB. I then tried to bring the quota back down to 50GB, but btrfs block volumes cannot be shrunk once grown (`incus config device set wazuh-server root size=50GiB` failed with "Cannot be shrunk"). So I kept the VM at 60GB, and enlarged the `bigpool` storage pool itself to 120GB, to have enough headroom for this not to happen again:
+
+```bash
+sudo truncate -s 120G /home/incus-btrfs.img
+sudo losetup -j /home/incus-btrfs.img
+sudo losetup -c /dev/loop3
+sudo btrfs filesystem resize max /mnt/incus-btrfs
+df -h /mnt/incus-btrfs
+```
+
+`truncate` only grows the file on disk; the loop device still has the old size cached, so `losetup -c` tells the kernel to re-read the file's real size. `btrfs filesystem resize max` then grows the filesystem to fill the whole (now bigger) loop device.
+
+The pool being bigger did not raise the VM's own quota by itself, so I also raised that qgroup directly, then confirmed it with `btrfs qgroup show`:
+
+```bash
+sudo btrfs qgroup limit 60G /mnt/incus-btrfs/pool/virtual-machines/lab-srv_wazuh-server
+sudo btrfs qgroup show -pcre /mnt/incus-btrfs
+incus config device set wazuh-server root size=60GiB --project lab-srv
+incus start wazuh-server --project lab-srv
+```
+
+![btrfs qgroup usage after the increase](assets/btrfs-qgroup-show.png)
 
 ### Step 6.1.3 - Install the server
 
@@ -825,7 +895,9 @@ sudo ip addr add 10.114.22.5/26 dev lab-net1.10
 sudo ip link set lab-net1.10 up
 ```
 
-This access is **temporary**: it is lost at the next reboot of the host.
+I made this persistent by extending `lab-net1-vlan.service` (the systemd service from Phase 3 that enables VLAN filtering on `lab-net1` at boot) with these same commands, as extra `ExecStart=` lines run in order.
+
+Config file: [`lab-net1-vlan.service`](configs/lab-net1-vlan.service)
 
 ### Step 6.1.4 - Open the firewall for the agent
 
@@ -835,7 +907,7 @@ The agent is in USERS and the server is in ADMIN, so the Phase 4 policy blocks t
 iifname $USERS ip daddr $WAZUH tcp dport { 1514, 1515 } counter accept
 ```
 
-Updated file: [`nftables.conf`](configs/nftable_firewall.conf)
+Updated file: [`nftables.conf`](configs/nftables.conf)
 
 ### Step 6.1.5 - Install the agent
 
@@ -849,7 +921,11 @@ systemctl enable --now wazuh-agent
 
 The agent appeared as **active** in the dashboard (`agent.id: 001`).
 
-### Step 6.1.6 - Proof that the traffic crosses the firewall
+### Step 6.1.6 - Static addresses
+
+Both machines got a DHCP reservation in Kea, matching their current lease, so they keep the same address across reboots: [`kea-dhcp4.conf`](configs/kea-dhcp4.conf)
+
+### Step 6.1.7 - Proof that the traffic crosses the firewall
 
 After the agent registered, I read the counter of the rule from the host:
 
@@ -861,7 +937,7 @@ incus exec router1 --project lab-srv -- nft list chain inet filter forward | gre
 
 The counter shows **3 packets (180 bytes)**. It only counts the first packet of each connection (three SYN packets of 60 bytes): the rest of each connection is accepted earlier by the `ct state established,related` rule. So the agent really goes through the exception I wrote.
 
-### Step 6.1.7 - Test 1: failed SSH logins
+### Step 6.1.8 - Test 1: failed SSH logins
 
 From inside `linux-agent`, I tried to log in 20 times with an account that does not exist:
 
@@ -882,7 +958,7 @@ The level 5 rule fires on each attempt. The level 10 rule is a correlation: it f
 
 ![Wazuh alerts for the failed SSH logins](assets/wazuh-ssh-alerts.png)
 
-### Step 6.1.8 - Test 2: file integrity monitoring (FIM)
+### Step 6.1.9 - Test 2: file integrity monitoring (FIM)
 
 FIM watches a folder and reports every change. In `/var/ossec/etc/ossec.conf` of the agent, I added this line inside the `<syscheck>` block:
 
@@ -918,9 +994,8 @@ Wazuh reported the three events:
 
 ### Current limits (Wazuh)
 
-- The Wazuh server address comes from DHCP (pool of VLAN 10). I still need to add a reservation in Kea so it never changes.
-- The host access to the dashboard (`lab-net1.10`) is not persistent.
 - Only one agent is connected, and only Linux logs and FIM are used. There are no custom rules and no active response yet.
+- No retention policy on the indexer yet; left unchecked, it will fill the disk again over time.
 
 ---
 

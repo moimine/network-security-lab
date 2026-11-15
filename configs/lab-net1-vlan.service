@@ -1,12 +1,18 @@
+sudo tee /etc/systemd/system/lab-net1-vlan.service <<'EOF'
 [Unit]
-Description=Enable VLAN filtering on Incus lab-net1 bridge
+Description=Enable VLAN filtering on Incus lab-net1 bridge and ADMIN (VLAN10) host access
 After=incus.service
 Requires=incus.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/sbin/ip link set dev lab-net1 type bridge vlan_filtering 1
+ExecStart=-/usr/sbin/bridge vlan add dev lab-net1 vid 10 self
+ExecStart=-/usr/sbin/ip link add link lab-net1 name lab-net1.10 type vlan id 10
+ExecStart=/usr/sbin/ip addr add 10.114.22.5/26 dev lab-net1.10
+ExecStart=/usr/sbin/ip link set lab-net1.10 up
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
+EOF
