@@ -9,7 +9,7 @@ Network, virtualization & cybersecurity homelab: DHCP, DNS, routing, VLAN segmen
 - [x] [Phase 2 - Network servers (DHCP/DNS)](#phase-2--network-servers)
 - [x] [Phase 3 - Routing and VLAN Segmentation](#phase-3--routing-and-vlan-segmentation)
 - [x] [Phase 4 - Firewall](#phase-4--firewall)
-- [ ] [Phase 5 - Active Directory](#phase-5--active-directory)
+- [x] [Phase 5 - Active Directory](#phase-5--active-directory)
 - [ ] [Phase 6 - Cyber Blue Team (detection)](#phase-6--cyber-blue-team-detection) - Wazuh done, Sysmon/Suricata to come
 - [ ] [Phase 7 - Cyber Red Team (attack)](#phase-7--cyber-red-team-attack)
 - [ ] [Phase 8 - Moving to real hardware](#phase-9--moving-to-real-hardware)
