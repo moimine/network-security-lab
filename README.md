@@ -730,7 +730,7 @@ I plan to rebuild the same policy on pfSense and compare it with this nftables v
 
 I started with the Windows Server evaluation ISO (free for 180 days, no account needed) from [microsoft.com/fr-fr/evalcenter/download-windows-server-2022](https://www.microsoft.com/fr-fr/evalcenter/download-windows-server-2022).
 
-Incus VMs use `virtio` devices for disk and network. Windows does not include `virtio` drivers by default, so the installer cannot see the virtual disk unless it is given them. I repacked the Windows ISO with `distrobuilder`, which injects the drivers directly into the installer image instead of loading them by hand during setup:
+Incus VMs use `virtio` devices for disk and network. Windows does not include `virtio` drivers by default, so the installer cannot see the virtual disk unless the drivers are supplied to it. I repacked the Windows ISO with `distrobuilder`, which injects the drivers directly into the installer image instead of loading them by hand during setup:
 
 ```bash
 sudo apt install -y distrobuilder rsync wimtools genisoimage libwin-hivex-perl virt-viewer
@@ -760,11 +760,366 @@ A few notes from getting this right:
 - `incus console --type=vga` needs a SPICE client on the host (`virt-viewer`) to actually show a window; without it, it only prints a socket path.
 - a vTPM is a software-emulated TPM chip: it gives the VM a virtual version of the physical security chip that normally stores encryption keys and checks boot integrity (used by BitLocker, Windows Hello, and required by Windows 11). Windows Server does not require it, but I added one anyway in case AD DS or disk encryption needs it later.
 
-Not done yet: the actual Windows Server installation and promotion to domain controller.
+### Installing Windows Server and promoting it to domain controller
 
-## Step 5.2 - Client machine
-## Step 5.3 - GPO
-## Step 5.4 - Low-privilege user
+From `sconfig`, I renamed the computer and set it to keep its current DHCP-leased address as a permanent reservation in Kea rather than a static IP (option 8, then the matching entry in [`kea-dhcp4.conf`](configs/kea-dhcp4.conf)) - `10.114.22.6`. I checked the result from PowerShell:
+
+```powershell
+ipconfig /all
+```
+
+![ws-dc1 network configuration after rename](assets/ws-dc1-ipconfig.png)
+
+Then I promoted it to the first domain controller of a brand new forest:
+
+```powershell
+Install-ADDSForest -DomainName "ad.homelab.local" -DomainNetbiosName "AD" -InstallDns
+```
+
+I picked `ad.homelab.local` (a subdomain of the existing `homelab.local` zone already served by `dns-server`) over `homelab.local` itself or a fully separate `lab.local`, specifically so the two DNS zones would have to cooperate through delegation (Step 5.2) instead of just coexisting - closer to a real split between an existing network's DNS and a newly deployed AD environment. The command also asks for a DSRM password (Directory Services Restore Mode - a separate emergency password used only to restore the directory in maintenance mode); like every other admin password in this lab, it stays in my own notes.
+
+`-InstallDns` installs the AD-integrated DNS role at the same time: the DNS zone for `ad.homelab.local` is no longer a flat text file like BIND's, it lives inside the AD database itself and replicates automatically to every domain controller.
+
+Once it rebooted into the domain, a couple of filtered checks confirm the forest is up:
+
+```powershell
+Get-ADDomain | Select-Object DNSRoot, NetBIOSName, DomainMode, PDCEmulator
+Get-ADForest | Select-Object Name, ForestMode, GlobalCatalogs
+```
+
+![AD domain and forest information](assets/ad-domain-info.png)
+
+## Step 5.2 - DNS delegation between `homelab.local` and `ad.homelab.local`
+
+With two separate DNS zones now in play - `homelab.local` (BIND, on `dns-server`) and `ad.homelab.local` (AD-integrated, on `ws-dc1`) - machines outside the AD zone need a way to find it, and `ws-dc1` needs a way to resolve everything else.
+
+**On `ws-dc1`:** I added `dns-server` as a forwarder, so any name outside its own zone gets sent there instead of failing or going straight to the internet:
+
+```powershell
+Add-DnsServerForwarder -IPAddress 10.114.22.3
+Resolve-DnsName dns-server.homelab.local   # resolved through the forwarder
+Resolve-DnsName google.com                 # forwarded further still, by dns-server's own forwarders
+```
+
+![DNS resolution test from ws-dc1](assets/ws-dc1-dns-resolution.png)
+
+**On `dns-server`:** the parent zone needs to know where to send anything under `ad.homelab.local`. I first tried a classic DNS delegation - an `NS` record plus a glue `A` record, added directly inside the existing `db.homelab.local` zone file (no new zone block needed in `named.conf.local`, since the delegated name is just data inside the parent zone):
+
+```
+ad.homelab.local.     IN  NS   ws-dc1.homelab.local.
+ws-dc1.homelab.local. IN  A    10.114.22.6
+```
+
+```bash
+named-checkzone homelab.local /etc/bind/db.homelab.local
+sudo rndc reload
+```
+
+This loaded fine and `dig +norecurse @10.114.22.3 ad.homelab.local NS` correctly showed the referral - the delegation itself was valid. But any *recursive* query for `ad.homelab.local` (the kind every real client sends) still came back `NXDOMAIN`. The reason: `dns-server` already had global forwarders configured for general internet resolution:
+
+```
+forwarders {
+    1.1.1.3;
+    1.0.0.3;
+};
+```
+
+Without an explicit `forward only` directive, BIND's default behaviour sends anything outside its own non-delegated authoritative data to those forwarders first - including, surprisingly, names under a delegation it already knows about locally. So queries for `ad.homelab.local` were quietly leaving for Cloudflare instead of going to `ws-dc1`, and Cloudflare correctly answered `NXDOMAIN` since the name does not exist publicly.
+
+The fix is a dedicated `forward` zone for that one subdomain, which takes priority over the global forwarders. Added in `/etc/bind/named.conf.local` on `dns-server`:
+
+```
+zone "ad.homelab.local" {
+    type forward;
+    forward only;
+    forwarders { 10.114.22.6; };
+};
+```
+
+```bash
+named-checkconf
+rndc reconfig
+dig @10.114.22.3 ad.homelab.local A +noall +answer
+dig @10.114.22.3 _ldap._tcp.ad.homelab.local SRV +noall +answer
+```
+
+`forward only` (as opposed to the default `forward first`) stops BIND from ever falling back to its own recursion or the global forwarders for this specific zone. The second `dig`, for an `SRV` record rather than a plain `A`, matters because that is what AD clients actually query first when locating a domain controller (`_ldap._tcp.<domain>`, `_kerberos._tcp.<domain>`) - testing only a plain name lookup can look fine while the records that matter for a real join are still broken.
+
+Config file: [`named.conf.local`](configs/named.conf.local).
+
+## Step 5.3 - AD structure: departments, groups and the AGDLP model
+
+Before creating any client machine, I designed an OU/group layout representative enough to be useful later, in Phase 7, as a target for a red-team exercise - not just three empty folders.
+
+**Three departments:** IT, Finance, RH (kept to three on purpose - enough to be meaningful without turning this into a full enterprise directory for a home lab).
+
+```powershell
+New-ADOrganizationalUnit -Name "IT" -Path "DC=ad,DC=homelab,DC=local"
+New-ADOrganizationalUnit -Name "Finance" -Path "DC=ad,DC=homelab,DC=local"
+New-ADOrganizationalUnit -Name "RH" -Path "DC=ad,DC=homelab,DC=local"
+```
+
+Each OU holds its own department's user accounts and (once joined) computer objects.
+
+**Groups follow the AGDLP model** (Account -> Global Group -> Domain Local Group -> Permission), the standard Microsoft pattern for assigning access without ever putting a user directly on a permission list.
+
+Global groups, one per department, live inside their own OU:
+
+```powershell
+New-ADGroup -Name "GG-IT"      -GroupScope Global -GroupCategory Security -Path "OU=IT,DC=ad,DC=homelab,DC=local"
+New-ADGroup -Name "GG-Finance" -GroupScope Global -GroupCategory Security -Path "OU=Finance,DC=ad,DC=homelab,DC=local"
+New-ADGroup -Name "GG-RH"      -GroupScope Global -GroupCategory Security -Path "OU=RH,DC=ad,DC=homelab,DC=local"
+```
+
+Domain local groups, one per resource, live together in their own dedicated OU rather than scattered across the department OUs:
+
+```powershell
+New-ADOrganizationalUnit -Name "Groupes-Ressources" -Path "DC=ad,DC=homelab,DC=local"
+
+New-ADGroup -Name "DL-RH-Confidential-Read"    -GroupScope DomainLocal -GroupCategory Security -Path "OU=Groupes-Ressources,DC=ad,DC=homelab,DC=local"
+New-ADGroup -Name "DL-Finance-Share-ReadWrite" -GroupScope DomainLocal -GroupCategory Security -Path "OU=Groupes-Ressources,DC=ad,DC=homelab,DC=local"
+New-ADGroup -Name "DL-IT-LocalAdmins"          -GroupScope DomainLocal -GroupCategory Security -Path "OU=Groupes-Ressources,DC=ad,DC=homelab,DC=local"
+```
+
+Then the nesting itself - global group inside domain local group:
+
+```powershell
+Add-ADGroupMember -Identity "DL-RH-Confidential-Read"    -Members "GG-RH"
+Add-ADGroupMember -Identity "DL-Finance-Share-ReadWrite" -Members "GG-Finance"
+Add-ADGroupMember -Identity "DL-IT-LocalAdmins"          -Members "GG-IT"
+```
+
+The global group (`GG-*`) represents *who someone is* (their department); the domain local group (`DL-*`) represents *what a resource grants access to*. Only the domain local group ever gets a real permission. This two-level indirection means a resource's ACL never has to be touched again when someone joins or leaves a department, only the global group's membership changes.
+
+One deliberate choice here: `GG-IT` is nested into `DL-IT-LocalAdmins` (it grants IT local-administrator rights on other departments' workstations, through the GPO in Step 5.5) but into neither `DL-RH-Confidential-Read` nor `DL-Finance-Share-ReadWrite`. IT can administer those machines without being able to read what is on them, a distinction that matters a lot once Phase 7 tries to escalate from one to the other.
+
+**One representative user per department**, each nested into its department's global group:
+
+```powershell
+$pwd = ConvertTo-SecureString "<password>" -AsPlainText -Force
+
+New-ADUser -Name "Alice IT"    -SamAccountName "ait"  -UserPrincipalName "ait@ad.homelab.local"  -Path "OU=IT,DC=ad,DC=homelab,DC=local"      -AccountPassword $pwd -Enabled $true -ChangePasswordAtLogon $true
+New-ADUser -Name "Bob Finance" -SamAccountName "bfin" -UserPrincipalName "bfin@ad.homelab.local" -Path "OU=Finance,DC=ad,DC=homelab,DC=local" -AccountPassword $pwd -Enabled $true -ChangePasswordAtLogon $true
+New-ADUser -Name "Carla RH"    -SamAccountName "crh"  -UserPrincipalName "crh@ad.homelab.local"  -Path "OU=RH,DC=ad,DC=homelab,DC=local"      -AccountPassword $pwd -Enabled $true -ChangePasswordAtLogon $true
+
+Add-ADGroupMember -Identity "GG-IT"      -Members "ait"
+Add-ADGroupMember -Identity "GG-Finance" -Members "bfin"
+Add-ADGroupMember -Identity "GG-RH"      -Members "crh"
+```
+
+`-ChangePasswordAtLogon $true` forces each user to set their own password on first login rather than keeping the one I typed here - the actual value used lives only in my own notes.
+
+```powershell
+Get-ADOrganizationalUnit -Filter * | Select-Object Name, DistinguishedName
+Get-ADGroup -Filter * | Select-Object Name, GroupScope, GroupCategory
+```
+
+![AD organizational units](assets/ad-ous.png)
+![AD security groups](assets/ad-groupes.png)
+
+### The "sensitive data" idea
+
+To give Phase 7 (Red Team) something concrete to go after, I planted one genuinely protected resource now: a share called `RH-Confidential$`, holding a placeholder file (`salaires_2026.txt`, with a short note making clear it is demo data, not a real payroll). It follows AGDLP end to end. For lab simplicity it is hosted directly on `ws-dc1` - in a real environment a file share should never live on a domain controller, and I list this as a known limitation below.
+
+```powershell
+New-Item -Path "C:\Shares\RH-Confidential" -ItemType Directory
+Set-Content -Path "C:\Shares\RH-Confidential\salaires_2026.txt" -Value "Donnée sensible de démonstration - salaires RH confidentiels"
+
+New-SmbShare -Name "RH-Confidential$" -Path "C:\Shares\RH-Confidential" -FullAccess "AD\DL-RH-Confidential-Read"
+
+# Retire l'héritage NTFS par défaut et pose une ACL propre
+icacls "C:\Shares\RH-Confidential" /inheritance:r
+icacls "C:\Shares\RH-Confidential" /grant "AD\DL-RH-Confidential-Read:(OI)(CI)R"
+icacls "C:\Shares\RH-Confidential" /grant "AD\Domain Admins:(OI)(CI)F"
+```
+
+```powershell
+Get-SmbShareAccess -Name "RH-Confidential$"
+icacls "C:\Shares\RH-Confidential"
+Get-ADGroupMember -Identity "DL-RH-Confidential-Read"
+```
+
+![RH-Confidential share ACL](assets/rh-confidential-acl.png)
+
+The trailing `$` in the share name hides it from normal network browsing - a realistic detail, but not a real security control, since it does nothing against an attacker who already knows the share's name.
+
+The effective access is always the more restrictive of the two layers: the share grants Full Control to the domain local group, but NTFS only grants it Read - so the real-world result is Read-only. This gap between IT's broad admin rights and its lack of access to this one share is exactly what I plan to test later: whether a weakened permission, a Kerberoastable account, or a known CVE can be used to cross that boundary, and I may deliberately loosen a setting at that point specifically to show why it mattered.
+
+## Step 5.4 - Client machines
+
+### Windows clients (Finance, RH): one golden image, cloned twice
+
+Rather than installing Windows 10 multiple times, I built one template VM, prepared it with Sysprep, and cloned it.
+
+The ISO this time comes from a different source than the Windows Server one: [microsoft.com/fr-fr/software-download/windows10iso](https://www.microsoft.com/fr-fr/software-download/windows10iso), Microsoft's own Windows 10 media creation page.
+
+Repacking the ISO follows the same `distrobuilder` process as the server ISO:
+
+```bash
+sudo distrobuilder --cache-dir ~/distrobuilder-cache repack-windows --windows-arch=amd64 Win10_22H2_French_x64v1.iso Win10_22H2_French_x64v1.incus.iso
+```
+
+The template VM:
+
+```bash
+incus init win10-template --empty --vm --project lab-srv -s bigpool
+incus config device set win10-template root size=25GiB --project lab-srv
+incus config device override win10-template eth0 vlan=20 --project lab-srv
+incus config device set win10-template eth0 network=lab-net1 --project lab-srv
+incus config set win10-template limits.cpu 2 --project lab-srv
+incus config set win10-template limits.memory 4GiB --project lab-srv
+incus config device add win10-template install disk source=/home/thales/Téléchargements/Win10_22H2_French_x64v1.incus.iso boot.priority=10 --project lab-srv
+incus start win10-template --console=vga --project lab-srv
+```
+
+25GiB and 2 vCPU / 4GiB RAM, placed in VLAN 20 (USERS) straight away.
+
+**Bypassing the Microsoft account requirement:** the OOBE (Out-Of-Box Experience, Windows's first-boot setup wizard) screen normally forces signing in with a Microsoft account before it will create a local one. At the "Configurer pour une organisation" screen, `Shift+F10` opens a command prompt, from which:
+
+```cmd
+start ms-cxh:localonly
+```
+
+jumps straight to the local "Create a user for this PC" screen (`OOBE\BYPASSNRO` is the usual fallback if that specific command ever stops working on a later Windows 10 build). I created a throwaway local account, just long enough to run Sysprep and never meant to survive past that point.
+
+**Generalizing the image:** once on the desktop, I ran Sysprep before ever joining this template to the domain:
+
+```cmd
+sysprep.exe /generalize /oobe /shutdown
+```
+
+`/generalize` strips machine-specific identifiers - most importantly the local Security Identifier (SID) - so that cloning the VM afterwards does not produce two machines secretly sharing the same SID (which causes AD, licensing, and networking problems down the line). `/oobe` sends each clone back to a fresh out-of-box setup screen on first boot, and `/shutdown` powers the VM off cleanly once done, ready to be copied.
+
+**Cloning and joining:**
+
+```bash
+incus copy win10-template client-finance --project lab-srv
+incus copy win10-template client-rh --project lab-srv
+incus start client-finance --console=vga --project lab-srv
+```
+
+Each clone goes through its own fresh OOBE (same local-account bypass as above), then gets renamed and joined to the domain in one step:
+
+```powershell
+Add-Computer -DomainName "ad.homelab.local" -NewName "client-finance" -Credential (Get-Credential) -Restart
+```
+
+The credential prompt needs the down-level logon name format, `AD\Administrateur`, not just `Administrateur`. At this point the machine has no idea yet which domain it belongs to, because it is not yet a member of one: it is still in the local Windows workgroup, a default grouping every standalone Windows machine starts in before joining a domain. Without a domain prefix, Windows assumes any username typed in refers to an account on the machine itself, so it looks for a local account called `Administrateur` rather than the one in AD - and rejects even a perfectly correct domain password, because it is checking the wrong account entirely. Prefixing it with `AD\` tells Windows explicitly to look that name up in the `AD` domain instead.
+
+One thing I ran into and would do differently next time: **renaming a machine that is already domain-joined** (as opposed to naming it at join time) needs full RPC (port 135 plus the dynamic port range 49152 to 65535) between the client and the DC, which would have meant opening a new, much wider flow in nftables just for that one operation. Joining with a new name in one single step only needs SMB (port 445), an exception that was already open and much narrower. Setting the final hostname before or during the join, rather than after, avoids ever needing that wide RPC range and the firewall change it would require.
+
+The firewall itself needed a new, narrow exception: client machines live in VLAN 20 (USERS) and the domain controller in VLAN 10 (ADMIN), so by the Phase 4 policy that traffic is blocked by default. I added Kerberos, LDAP, kpasswd, SMB and NTP specifically toward `ws-dc1`, in `/etc/nftables.conf` on `router1`:
+
+```
+define AD_DC = 10.114.22.6
+define AD_TCP_PORTS = {88,389,445,464}
+define AD_UDP_PORTS = {88,123,389,464}
+
+iifname $USERS ip daddr $AD_DC tcp dport $AD_TCP_PORTS counter accept
+iifname $USERS ip daddr $AD_DC udp dport $AD_UDP_PORTS counter accept
+```
+
+placed before the general `USERS -> ADMIN: reject` rule, same pattern as the Wazuh exception in Phase 6. Config file: [`nftables.conf`](configs/nftables.conf).
+
+Once joined, each computer object lands by default in the generic `CN=Computers` container - not a real OU, and notably one that cannot receive GPOs - so I moved each one into its department's OU:
+
+```powershell
+Move-ADObject -Identity "CN=client-finance,CN=Computers,DC=ad,DC=homelab,DC=local" -TargetPath "OU=Finance,DC=ad,DC=homelab,DC=local"
+Move-ADObject -Identity "CN=client-rh,CN=Computers,DC=ad,DC=homelab,DC=local" -TargetPath "OU=RH,DC=ad,DC=homelab,DC=local"
+```
+
+### IT department: a Linux client instead of Windows
+
+For IT, I deliberately chose a Linux container joined via `realmd`/`sssd` rather than a third Windows clone. It is less realistic in one specific way (no GPO support at all for this client), but it makes the department line-up more representative of an actual mixed environment, and costs a lot less in CPU/RAM/disk than another full Windows VM - a trade-off I was comfortable accepting for a lab.
+
+```bash
+incus launch images:ubuntu/22.04 client-it --project lab-srv --profile default --profile lab-limits --network lab-net1
+incus config device set client-it eth0 vlan=20 --project lab-srv   # 'override' fails here: --network already created an instance-level eth0
+incus restart client-it --project lab-srv
+```
+
+```bash
+apt install realmd sssd sssd-tools libnss-sss libpam-sss adcli samba-common-bin oddjob oddjob-mkhomedir packagekit
+```
+
+`realmd` itself does nothing directly - it detects the kind of domain available (`realm discover`, which checks the DNS `SRV` records from Step 5.2 and does a quick, unauthenticated LDAP lookup) and then hands off to the right tool: `adcli` to do the actual join, `sssd` to handle day-to-day authentication afterwards.
+
+```bash
+realm discover ad.homelab.local
+realm join -v -U Administrateur ad.homelab.local
+```
+
+The first real attempt at this failed outright with `realm: No such realm found` - a direct consequence of the DNS forwarding bug described in Step 5.2, since `realm discover` depends entirely on resolving those `SRV` records correctly. Once that was fixed, discovery succeeded; the join itself then failed a second time with `Can't contact LDAP server`, this time because of the firewall rule described above (client containers sit in VLAN 20, the DC in VLAN 10) - adding the narrow AD exception resolved it.
+
+`adcli`'s verbose output shows the real mechanics: it authenticates with Kerberos (GSSAPI/SPNEGO) using the admin credential, computes the machine account name (`client-it` -> `CLIENT-IT$`), creates that computer object in AD over LDAP, and retrieves a keytab (`/etc/krb5.keytab`) - a file holding the machine's own Kerberos secret, letting it prove its identity afterwards without ever storing a password for itself.
+
+From here on, `sssd` is what makes day-to-day login work, through two completely separate integrations with Linux:
+
+- **NSS** (Name Service Switch): `getent passwd`, `id`, and similar commands transparently query AD over LDAP for identity lookups, because `sssd` is registered as an NSS source.
+- **PAM**: the actual password check during `login`/`su`/`sshd` goes through `pam_sss.so`, which performs real Kerberos authentication against the DC.
+
+Two small fixes were needed before a login actually worked end to end:
+
+```bash
+pam-auth-update --enable mkhomedir
+```
+
+creates each user's `/home` directory automatically on first successful login (nothing exists ahead of time for a remote account, unlike a local one).
+
+Under `[domain/ad.homelab.local]` in `/etc/sssd/sssd.conf`:
+```ini
+ad_gpo_access_control = permissive
+```
+
+`sssd`'s AD provider evaluates Group Policy for access control by default (`enforcing`), reading the SYSVOL share over SMB to decide who is allowed to log on - mirroring Windows behaviour. Since this client has no GPO written for it at all, that evaluation always failed and blocked every login with a generic `System error`. `permissive` keeps the evaluation (and its logging) without ever using it to deny access - the right compromise until a GPO actually targets Linux clients, which, realistically, will not happen here.
+
+Config file: [`sssd.conf`](configs/sssd.conf).
+
+```bash
+realm list
+id tintin@ad.homelab.local
+getent passwd tintin@ad.homelab.local
+su - tintin@ad.homelab.local
+```
+
+![client-it joined to AD and a successful SSSD login](assets/client-it-sssd-login.png)
+
+Login names are fully qualified (`user@ad.homelab.local`) by default once joined to an AD domain, specifically to avoid any collision between a local Linux account and an AD account sharing the same short name - this can be turned off (`use_fully_qualified_names = False`) once that risk is ruled out.
+
+### Storage housekeeping along the way
+
+The `default` Incus storage pool - a 6GiB loopback file shared by every container and small VM in the lab, `router1` and `dns-server` included - filled up completely while installing packages inside `client-it`. I grew it the same way I had already grown `bigpool` back in Phase 6, applied directly to Incus's own backing file:
+
+```bash
+sudo truncate -s 20G /var/lib/incus/disks/default.img
+sudo losetup -c /dev/loop4                      # found with: sudo losetup -j /var/lib/incus/disks/default.img
+sudo btrfs filesystem resize max /var/lib/incus/storage-pools/default
+```
+
+## Step 5.5 - GPO: IT gets local admin on Finance and RH workstations
+
+This is the piece that makes `DL-IT-LocalAdmins` actually do something: a GPO that drops that group into the local Administrators group of every Finance and RH workstation, representing an IT-support model where IT can administer any department's machine without having rights to the data on it.
+
+```powershell
+New-GPO -Name "GPO-IT-LocalAdmins"
+New-GPLink -Name "GPO-IT-LocalAdmins" -Target "OU=Finance,DC=ad,DC=homelab,DC=local"
+New-GPLink -Name "GPO-IT-LocalAdmins" -Target "OU=RH,DC=ad,DC=homelab,DC=local"
+```
+
+The GPO object and its links to the Finance and RH OUs are created this way, but the actual setting - a Restricted Groups rule adding `DL-IT-LocalAdmins` to the local Administrators group - has to be configured through the GPO editor itself (`gpmc.msc` -> Computer Configuration -> Policies -> Windows Settings -> Security Settings -> Restricted Groups), since this isn't natively scriptable in PowerShell. I'll walk through that GUI step and document it with a screenshot next session.
+
+Note this GPO targets Finance and RH, not IT: it's IT's group being pushed onto other departments' machines, not onto its own.
+
+## Current limits (Active Directory)
+
+- Only one domain controller: no redundancy, and the AD-integrated DNS has a single point of failure.
+- The GPO object and its links exist, but the Restricted Groups setting itself still needs to be configured through `gpmc.msc` (Step 5.5); the IT Linux client cannot receive GPOs by design regardless.
+- The firewall exception for AD traffic is per-destination-IP (`$AD_DC`), not per-service-name - adding a second DC later means updating this rule by hand.
+- `RH-Confidential` is hosted directly on `ws-dc1` for lab simplicity; a file share should never live on a domain controller in production.
+
+## Next
+
+Phase 6 (Blue Team) comes next: Sysmon on the Windows clients and Suricata for network detection, both forwarding into Wazuh.
 
 ---
 
